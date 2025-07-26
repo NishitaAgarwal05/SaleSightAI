@@ -1,8 +1,10 @@
 import json
-from kafka import KafkaConsumer
+import redis
+from kafka import KafkaConsumer, KafkaProducer
 from models import SupportEvent, Trigger
 from datetime import datetime, timedelta, timezone
 
+r = redis.Redis(host='redis', port=6379, decode_responses=True)
 
 # Kafka setup
 consumer = KafkaConsumer(
@@ -33,10 +35,14 @@ def detect_triggers(event: SupportEvent) -> Trigger | None:
         return Trigger(
             customer_id=event.customer_id,
             trigger_type='multiple_calls',
-            detected_at=datetime.utcnow()
+            detected_at=datetime.now(timezone.utc)
         )
     return None
 
+producer = KafkaProducer(
+    bootstrap_servers=['kafka:9092'],
+    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+)
 
 def consume_events():
     print("[CONSUMER] Started consume_events()")
@@ -51,5 +57,9 @@ def consume_events():
         print(f"[DEBUG] Parsed event: {event}")  
         trigger = detect_triggers(event)
         if trigger:
-            # Here you might publish to another Kafka topic or call another service
-            print(f"Trigger detected: {trigger.dict()}")
+            ctx = r.hgetall(f"cust:{event.customer_id}")
+            print(f"[DEBUG] Context for customer {event.customer_id}: {ctx}")
+            enriched_trigger = {**json.loads(trigger.model_dump_json()), **ctx}
+            producer.send("sales-triggers", enriched_trigger)
+            producer.flush()
+            print(f"Published enriched trigger: {enriched_trigger}")
