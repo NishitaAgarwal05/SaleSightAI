@@ -1,0 +1,6 @@
+fastapi
+uvicorn[kcp]
+kafka-python
+pydantic
+sqlalchemy
+psycopg2-binary
