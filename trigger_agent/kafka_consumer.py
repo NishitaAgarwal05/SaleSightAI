@@ -1,7 +1,7 @@
 import json
 import redis
 from kafka import KafkaConsumer, KafkaProducer
-from models import SupportEvent, Trigger
+from models import SupportEvent, Trigger, TriggerType
 from datetime import datetime, timedelta, timezone
 
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
@@ -13,30 +13,68 @@ consumer = KafkaConsumer(
     group_id='trigger-agent-group', 
     value_deserializer=lambda m: json.loads(m.decode('utf-8'))
 )
-
-# In-memory store for event history (for prototype)
-event_history: dict[int, list[SupportEvent]] = {}
-
-# Detection logic: example rule
+# thresholds for dynamic triggers
 CALL_THRESHOLD = 3
-WINDOW_MINUTES = 60 * 24  # last 24 hours
+WINDOW_MINUTES = 60 * 24  # 24 hours
+USAGE_THRESHOLD_HOURS = 100  # e.g. nearing cap
+INACTIVITY_HOURS = 72        # no events for 3 days
 
+# in-memory history store
+event_history: dict[int, list[SupportEvent]] = {}
+last_event_time: dict[int, datetime] = {}
 
-def detect_triggers(event: SupportEvent) -> Trigger | None:
-    # Add event to history
-    history = event_history.setdefault(event.customer_id, [])
+def detect_triggers(event: SupportEvent) -> Optional[Trigger]:
+    now = datetime.now(timezone.utc)
+    cust_id = event.customer_id
+    
+    # update last seen time for inactivity detection
+    last_event_time[cust_id] = event.timestamp
+
+    # save event into history
+    history = event_history.setdefault(cust_id, [])
     history.append(event)
 
-    # Filter for calls in the window
-    window_start = datetime.now(timezone.utc) - timedelta(minutes=WINDOW_MINUTES)
-    recent_calls = [e for e in history if e.type == 'call' and e.timestamp >= window_start]
+    # normalize and keep history size bounded
+    cutoff = now - timedelta(days=7)
+    event_history[cust_id] = [e for e in history if e.timestamp >= cutoff]
 
-    if len(recent_calls) >= CALL_THRESHOLD:
+    # 1. Multiple calls within window
+    calls = [
+        e for e in event_history[cust_id]
+        if e.type == "call" and e.timestamp >= (now - timedelta(minutes=WINDOW_MINUTES))
+    ]
+    if len(calls) >= CALL_THRESHOLD:
         return Trigger(
-            customer_id=event.customer_id,
-            trigger_type='multiple_calls',
-            detected_at=datetime.now(timezone.utc)
+            customer_id=cust_id,
+            trigger_type=TriggerType.MULTIPLE_CALLS.value,
+            detected_at=now
         )
+
+    # 2. Subscription cancelled
+    if event.type == "subscription" and getattr(event, "status", "").lower() == "cancelled":
+        return Trigger(
+            customer_id=cust_id,
+            trigger_type=TriggerType.SUBSCRIPTION_CANCELLED.value,
+            detected_at=now
+        )
+
+    # 3. Usage nearing cap (context updated externally)
+    if event.type == "usage_update" and getattr(event, "usage_hours", 0) >= USAGE_THRESHOLD_HOURS:
+        return Trigger(
+            customer_id=cust_id,
+            trigger_type=TriggerType.USAGE_NEARING_CAP.value,
+            detected_at=now
+        )
+
+    # 4. Inactivity (if no events for threshold hours)
+    last_ts = last_event_time.get(cust_id)
+    if last_ts and (now - last_ts) > timedelta(hours=INACTIVITY_HOURS):
+        return Trigger(
+            customer_id=cust_id,
+            trigger_type=TriggerType.INACTIVITY.value,
+            detected_at=now
+        )
+
     return None
 
 producer = KafkaProducer(
