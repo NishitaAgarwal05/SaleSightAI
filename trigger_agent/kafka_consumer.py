@@ -3,6 +3,7 @@ import redis
 from kafka import KafkaConsumer, KafkaProducer
 from models import SupportEvent, Trigger, TriggerType
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
 
@@ -51,7 +52,7 @@ def detect_triggers(event: SupportEvent) -> Optional[Trigger]:
         )
 
     # 2. Subscription cancelled
-    if event.type == "subscription" and getattr(event, "status", "").lower() == "cancelled":
+    if event.type == "subscription_canceled":
         return Trigger(
             customer_id=cust_id,
             trigger_type=TriggerType.SUBSCRIPTION_CANCELLED.value,
